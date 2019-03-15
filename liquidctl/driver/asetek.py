@@ -4,8 +4,8 @@
 Supported devices
 -----------------
 
- - [⋯] EVGA CLC (120 CL12, 240 or 280)
- - [ ] NZXT Kraken X (X31, X41 or X61)
+ - [✓] EVGA CLC (120 CL12, 240 or 280)
+ - [⋯] NZXT Kraken X (X31, X41 or X61)
 
 
 Driver features
@@ -22,7 +22,7 @@ Using the latest 690LC coolers (EVGA CLCs) as a reference:
 
 Other 690LC coolers (might) operate with quirks:
 
- - [ ] implement quirks for second generation Krakens
+ - [⋯] implement quirks for second generation Krakens
 
 
 Copyright (C) 2018–2019  Jonas Malaco
@@ -84,6 +84,7 @@ _UNKNOWN_OPEN_VALUE = 0xFFFF
 # Control request type
 _USBXPRESS = usb.util.CTRL_OUT | usb.util.CTRL_TYPE_VENDOR | usb.util.CTRL_RECIPIENT_DEVICE
 
+
 def _clamp(val, lo, hi, desc='value'):
     if val < lo:
         LOGGER.info('%s %s clamped to lo=%s, hi=%s', desc, val, lo, hi)
@@ -95,12 +96,48 @@ def _clamp(val, lo, hi, desc='value'):
         return val
 
 
-class AsetekDriver(UsbDeviceDriver):
-    """Work in progress: USB driver for fifth generation Asetek coolers."""
+class CommonAsetekDriver(UsbDeviceDriver):
+    """Common fuctions of fifth generation Asetek devices."""
 
-    SUPPORTED_DEVICES = [
-        (0x2433, 0xb200, None, 'Asetek 690LC (EVGA, NZXT or other) !!very experimental!!', {}),
-    ]
+    def _open(self):
+        """Open the USBXpress device."""
+        LOGGER.debug('open device')
+        self.device.ctrl_transfer(_USBXPRESS, _USBXPRESS_REQUEST, _USBXPRESS_CLEAR_TO_SEND)
+
+    def _close(self):
+        """Close the USBXpress device."""
+        LOGGER.debug('close device')
+        self.device.ctrl_transfer(_USBXPRESS, _USBXPRESS_REQUEST, _USBXPRESS_NOT_CLEAR_TO_SEND)
+
+    def _begin_transaction(self):
+        """Begin a new transaction before writing to the device."""
+        LOGGER.debug('begin transaction')
+        self.device.ctrl_transfer(_USBXPRESS, _USBXPRESS_REQUEST, _USBXPRESS_FLUSH_BUFFERS)
+
+    def _write(self, data):
+        LOGGER.debug('write %s', ' '.join(format(i, '02x') for i in data))
+        self.device.write(_WRITE_ENDPOINT, data, _WRITE_TIMEOUT)
+
+    def _end_transaction_and_read(self):
+        """End the transaction by reading from the device.
+
+        According to the official documentation, as well as Craig's open-source
+        implementation (libSiUSBXp), it should be necessary to check the queue
+        size and read data in chunks.  However, leviathan and its derivatives
+        seem to work fine without this complexity; we currently try the same
+        approach.
+        """
+        msg = self.device.read(_READ_ENDPOINT, _READ_LENGTH, _READ_TIMEOUT)
+        LOGGER.debug('received %s', ' '.join(format(i, '02x') for i in msg))
+        self.device.release()
+        return msg
+
+    def _configure_device(self, color1=[0, 0, 0], color2=[0, 0, 0], color3=[255, 0, 0],
+                          alert_temp=_HIGH_TEMPERATURE, interval1=0, interval2=0,
+                          blackout=False, fading=False, blinking=False, enable_alert=True):
+        self._write([0x10] + color1 + color2 + color3
+                    + [alert_temp, interval1, interval2, not blackout, fading,
+                       blinking, enable_alert, 0x00, 0x01])
 
     def connect(self, **kwargs):
         """Connect to the device."""
@@ -113,16 +150,24 @@ class AsetekDriver(UsbDeviceDriver):
             self._close()
             self._open()
 
-    def disconnect(self, **kwargs):
-        """Disconnect from the device."""
-        self._close()
-        super().disconnect()
-
     def initialize(self, **kwargs):
         """Initialize the device."""
         self._begin_transaction()
         self._configure_device()
         self._end_transaction_and_read()
+
+    def disconnect(self, **kwargs):
+        """Disconnect from the device."""
+        self._close()
+        super().disconnect()
+
+
+class AsetekDriver(CommonAsetekDriver):
+    """USB driver for modern fifth generation Asetek coolers."""
+
+    SUPPORTED_DEVICES = [
+        (0x2433, 0xb200, None, 'Modern Asetek 690LC (EVGA CLC or other) (experimental)', {}),
+    ]
 
     def get_status(self, **kwargs):
         """Get a status report.
@@ -233,43 +278,66 @@ class AsetekDriver(UsbDeviceDriver):
             LOGGER.warning('report: failed to read after setting speed')
             LOGGER.debug(err, exc_info=True)
 
-    def _open(self):
-        """Open the USBXpress device."""
-        LOGGER.debug('open device')
-        self.device.ctrl_transfer(_USBXPRESS, _USBXPRESS_REQUEST, _USBXPRESS_CLEAR_TO_SEND)
 
-    def _close(self):
-        """Close the USBXpress device."""
-        LOGGER.debug('close device')
-        self.device.ctrl_transfer(_USBXPRESS, _USBXPRESS_REQUEST, _USBXPRESS_NOT_CLEAR_TO_SEND)
+class LegacyAsetekDriver(CommonAsetekDriver):
+    """USB driver for legacy fifth generation Asetek coolers."""
 
-    def _begin_transaction(self):
-        """Begin a new transaction before writing to the device."""
-        LOGGER.debug('begin transaction')
-        self.device.ctrl_transfer(_USBXPRESS, _USBXPRESS_REQUEST, _USBXPRESS_FLUSH_BUFFERS)
+    SUPPORTED_DEVICES = [
+        (0x2433, 0xb200, None, 'Legacy Asetek 690LC (NZXT Kraken or other) (experimental)', {}),
+    ]
 
-    def _end_transaction_and_read(self):
-        """End the transaction by reading from the device.
+    def get_status(self, **kwargs):
+        """Get a status report.
 
-        According to the official documentation, as well as Craig's open-source
-        implementation (libSiUSBXp), it should be necessary to check the queue
-        size and read data in chunks.  However, leviathan and its derivatives
-        seem to work fine without this complexity; we currently try the same
-        approach.
+        Returns a list of `(property, value, unit)` tuples.
         """
-        msg = self.device.read(_READ_ENDPOINT, _READ_LENGTH, _READ_TIMEOUT)
-        LOGGER.debug('received %s', ' '.join(format(i, '02x') for i in msg))
-        self.device.release()
-        return msg
+        self._begin_transaction()
+        self._configure_device()  # TODO replace with self._configure_fixed_speeds()
+        msg = self._end_transaction_and_read()
+        firmware = '{}.{}.{}.{}'.format(*tuple(msg[0x17:0x1b]))
+        return [
+            ('Liquid temperature', msg[10] + msg[14]/10, '°C'),
+            ('Fan speed', msg[0] << 8 | msg[1], 'rpm'),
+            ('Pump speed', msg[8] << 8 | msg[9], 'rpm'),
+            ('Firmware version', firmware, '')
+        ]
 
-    def _configure_device(self, color1=[0, 0, 0], color2=[0, 0, 0], color3=[255, 0, 0],
-                          alert_temp=_HIGH_TEMPERATURE, interval1=0, interval2=0,
-                          blackout=False, fading=False, blinking=False, enable_alert=True):
-        self._write([0x10] + color1 + color2 + color3
-                    + [alert_temp, interval1, interval2, not blackout, fading,
-                       blinking, enable_alert, 0x00, 0x01])
+    def set_color(self, channel, mode, colors, time_per_color=1, time_off=None, **kwargs):
+        """Set the color mode for a specific channel."""
+        # keyword arguments may have been forwarded from cli args and need parsing
+        if isinstance(time_per_color, str):
+            time_per_color = int(time_per_color)
+        if isinstance(time_off, str):
+            time_off = int(time_off)
+        colors = list(colors)
+        self._begin_transaction()
+        if mode == 'fading':
+            self._configure_device(fading=True, color1=colors[0], color2=colors[1],
+                                   interval1=_clamp(time_per_color, 1, 255, 'time per color'))
+        elif mode == 'blinking':
+            if time_off is None:
+                time_off = time_per_color
+            self._configure_device(blinking=True, color1=colors[0],
+                                   interval1=_clamp(time_off, 1, 255, 'time off'),
+                                   interval2=_clamp(time_per_color, 1, 255, 'time per color'))
+        elif mode == 'fixed':
+            self._configure_device(color1=colors[0])
+        elif mode == 'blackout':  # stronger than just 'off' (suppresses alerts)
+            self._configure_device(blackout=True)
+        else:
+            raise KeyError('Unknown lighting mode {}'.format(mode))
+        self._end_transaction_and_read()
 
-    def _write(self, data):
-        LOGGER.debug('write %s', ' '.join(format(i, '02x') for i in data))
-        self.device.write(_WRITE_ENDPOINT, data, _WRITE_TIMEOUT)
+    def set_fixed_speed(self, channel, duty, **kwargs):
+        """Set channel to a fixed speed duty."""
+        # TODO restore speed settings
+        mtype, dmin, dmax = _FIXED_SPEED_CHANNELS[channel]
+        duty = _clamp(duty, dmin, dmax)
+        # TODO save channel/duty
+        # TODO call/move to self._configure_fixed_speeds():
+        self._begin_transaction()
+        # TODO for each channel:
+        LOGGER.info('setting %s duty to %i%%', channel, duty)
+        self._write([mtype, duty])
+        self._end_transaction_and_read()
 
